@@ -230,7 +230,7 @@ See issues ERR-1, ERR-2, OBS-1, and STR-* in the backend review for the current 
 
 ---
 
-## 8. Email: react-email and AWS SES
+## 8. Email: react-email and AWS SES (This is also analyzed on the frontend recommended architecture so that we can use that to keep the dependencies there, take the one you prefer)
 
 Email is an integration like any other and lives under `integrations/emails`.
 
