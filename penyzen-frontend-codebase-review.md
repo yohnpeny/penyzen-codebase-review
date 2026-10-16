@@ -24,6 +24,7 @@
 6. [Authentication](#6-authentication)
 7. [Testing](#7-testing)
 8. [What to fix first](#8-what-to-fix-first)
+9. [Additional Security & Reliability Findings](#9-additional-security--reliability-findings)
 
 ---
 
@@ -340,10 +341,51 @@ flowchart LR
 
 | Order | Focus | Issues |
 |---|---|---|
-| 1 | Quick safety | P5, P4 (labels, live regions, icon-button names) |
+| 1 | Quick safety | P5, P4 (labels, live regions, icon-button names), F1-02, F1-03 |
 | 2 | Contract & data layer | P1, P7 |
 | 3 | UI system | P6 |
 | 4 | State & forms | P2, P3, P8 |
 | 5 | Performance, SEO & auth | P10, P13, P9, P11 |
 | 6 | Tests | P14 |
 | — | Continuous (with feature work) | P12 |
+
+---
+
+## 9. Additional Security & Reliability Findings
+
+#### F1-02 — Fix open redirect via backslash bypass in safeNext
+
+**Priority:** 🟠 High
+
+**What:** `safeNext(raw)` in `apps/web/src/lib/nav.ts` checks only `raw.startsWith('/') && !raw.startsWith('//')`.
+
+**Why:** An input such as `/\\attacker.com` passes both checks. Modern browsers normalize backslashes in URL paths (`/\` or `/\\`) to `//attacker.com`, treating it as a protocol-relative URL and redirecting the victim to an external phishing or malicious domain upon login.
+
+**How:** Disallow backslashes (`\`) and unencoded control characters completely. Enforce a strict relative path check using regex (e.g. `/^\/[a-zA-Z0-9_\-\/~.?=&%#]+$/`) or verify that `new URL(raw, 'http://localhost').origin === 'http://localhost'`. Return `null` if any backslash is detected.
+
+**Where:** `apps/web/src/lib/nav.ts:5-7`
+
+**Acceptance:**
+
+- [ ] `safeNext('/\\attacker.com')` returns `null`.
+- [ ] `safeNext('/\\/attacker.com')` returns `null`.
+- [ ] `safeNext('/dashboard')` and valid internal relative URLs return the expected path.
+- [ ] Unit tests in `apps/web/src/lib/nav.test.ts` assert rejection of backslash bypasses and protocol-relative URLs.
+
+#### F1-03 — Check response status on S3 presigned cover image upload
+
+**Priority:** 🟠 High
+
+**What:** In `campaigns/[id]/edit/page.tsx`, `uploadCover` performs `await fetch(uploadUrl, { method: 'PUT', body: file, ... })` to an S3 presigned URL and immediately calls `PATCH /v1/campaigns/${campaignId}` with `coverImageUrl: publicUrl` without verifying the upload response status.
+
+**Why:** Native browser `fetch()` does not reject on HTTP 4xx or 5xx responses. If S3 rejects the PUT request (e.g., due to an expired presigned URL, signature mismatch, network failure, or permission error), `res.ok` is `false`, but the frontend silently proceeds to patch the campaign with `publicUrl`, permanently corrupting the campaign cover with a broken image link.
+
+**How:** Check `if (!uploadRes.ok)` immediately after the S3 `PUT` fetch. If the upload failed, throw a descriptive error (`new Error('Failed to upload image to storage')`) to display the error banner and abort the subsequent campaign `PATCH` call.
+
+**Where:** `apps/web/src/app/(dashboard)/dashboard/campaigns/[id]/edit/page.tsx:187-195`
+
+**Acceptance:**
+
+- [ ] Code inspects `uploadRes.ok` after the S3 PUT request.
+- [ ] A non-2xx S3 response aborts the flow, displays a user-facing error message, and does not execute the `PATCH` request.
+- [ ] A component test mocks a 403 S3 PUT failure and asserts `PATCH` is never called.

@@ -26,6 +26,7 @@
 8. [Infrastructure & Deployment](#8-infrastructure--deployment)
 9. [Error Handling & API Responses](#9-error-handling--api-responses)
 10. [What to fix first](#10-what-to-fix-first)
+11. [Additional Security & Reliability Findings](#11-additional-security--reliability-findings)
 
 ---
 
@@ -1013,7 +1014,160 @@ Database first, then critical security, then the rest.
 | Order | Focus | Issues |
 |---|---|---|
 | 1 | Database foundation | DAT-0, DAT-1, DAT-7 |
-| 2 | Critical security & access | SEC-1, SEC-2, AUT-1, AUT-3, ABU-1, ABU-2 |
-| 3 | High | SEC-3, SEC-4, SEC-5, SEC-8, AUT-2, AUT-4, AUT-5, AUT-6, DAT-2, DAT-3, DAT-5, DAT-6, DAT-8, STR-1, STR-2, STR-3, STR-7, TST-1, TST-2, TST-3, TST-4, TST-5, OBS-1, OBS-3, ERR-1, ERR-2 |
+| 2 | Critical security & access | SEC-1, SEC-2, AUT-1, AUT-3, ABU-1, ABU-2, NEW-01, B3-02 |
+| 3 | High | SEC-3, SEC-4, SEC-5, SEC-8, AUT-2, AUT-4, AUT-5, AUT-6, DAT-2, DAT-3, DAT-5, DAT-6, DAT-8, STR-1, STR-2, STR-3, STR-7, TST-1, TST-2, TST-3, TST-4, TST-5, OBS-1, OBS-3, ERR-1, ERR-2, B1-02, B2-01, B3-04, B4-01, I1-09, X1-10 |
 | 4 | Medium | SEC-6, SEC-7, SEC-9, AUT-7, DAT-4, ABU-3, STR-4, STR-5, STR-6, TST-6, TST-7, OBS-2, OBS-4, INF-1, INF-2 |
 | 5 | Low | STR-8, TST-8, INF-3 |
+
+---
+
+## 11. Additional Security & Reliability Findings
+
+#### NEW-01 — Validate verified grant amount in Chariot DAF webhook
+
+**Priority:** 🔴 Critical
+
+**What:** In `daf.service.ts`, the `grant.paid` webhook handler increments `Campaign.raisedAmountCents` using `donation.amountCents` (which is user-supplied when initiating the DAF grant in the frontend) instead of reading the verified grant amount (`payload.grant.amount`) sent by the Chariot webhook.
+
+**Why:** An attacker can initiate a $1 DAF grant with `amountCents: 100000000` ($1,000,000), complete the $1 grant on Chariot, and upon webhook delivery, the campaign's raised amount and ledger are credited with $1,000,000 in fraudulent funds without any error.
+
+**How:** Update `processChariotWebhook` in `daf.service.ts` to read `payload.grant.amount` from the verified webhook. Assert that `payload.grant.amount === donation.amountCents` (or overwrite/update `donation.amountCents` and `donation.netAmountCents` with the verified grant amount before updating campaign counters and ledger entries). If there is a mismatch, log a critical security warning and mark the donation as flagged or rejected.
+
+**Where:** `services/payment-service/src/services/daf.service.ts:54-82`
+
+**Acceptance:**
+
+- [ ] `processChariotWebhook` reads `payload.grant.amount` from the verified webhook payload.
+- [ ] Campaign counter and ledger entry increments use the verified `payload.grant.amount`.
+- [ ] A mismatch between user-supplied `donation.amountCents` and webhook `payload.grant.amount` is rejected or reconciled to the verified amount.
+- [ ] A test verifies that a forged `amountCents` in `donation` cannot inflate campaign totals when a grant for a different amount is paid.
+
+#### B3-02 — Prevent organizer republish after admin moderation pause
+
+**Priority:** 🔴 Critical
+
+**What:** When an administrator pauses a campaign for content or policy violations (`adminPausedById` is set), the organizer can bypass moderation simply by calling `publishCampaign` again, which explicitly clears all moderation fields (`adminPausedAt: null, adminPauseReason: null, adminPausedById: null`).
+
+**Why:** Administrative content moderation and suspension have no enforcement. An organizer running a fraudulent or violating campaign can immediately unpause and republish their campaign, erasing all audit evidence of the admin pause.
+
+**How:** In `services/campaign-service/src/services/campaign.service.ts:publishCampaign`, check if `campaign.adminPausedById !== null`. If so, throw a `ForbiddenError('This campaign has been paused by an administrator and cannot be republished without admin review')`. Only an administrator calling an unpause endpoint should be permitted to clear `adminPausedById`.
+
+**Where:** `services/campaign-service/src/services/campaign.service.ts:346-361`
+
+**Acceptance:**
+
+- [ ] `publishCampaign` rejects calls with 403 Forbidden when `campaign.adminPausedById !== null`.
+- [ ] `adminPausedAt`, `adminPauseReason`, and `adminPausedById` are preserved and cannot be cleared by the organizer.
+- [ ] Only an admin route/action can unpause an administratively paused campaign.
+- [ ] A test asserts that an organizer attempting to publish an admin-paused campaign receives 403 Forbidden.
+
+#### B1-02 — Fix Stripe Connect refresh_url to point to frontend
+
+**Priority:** 🟠 High
+
+**What:** In `connect.service.ts`, `getOnboardingLink` sets `refresh_url` to `${API_URL}/v1/connect/onboard`. When an onboarding link expires or fails, Stripe redirects the organizer's browser to this URL using a `GET` request.
+
+**Why:** `/v1/connect/onboard` is a `POST`-only API endpoint requiring a Cognito JWT authorization header. When Stripe redirects the browser via `GET` with no authorization headers, API Gateway returns a 404 or 401 error, leaving the organizer stranded on a broken JSON error screen.
+
+**How:** Update `refresh_url` to point to the frontend application route (`CONNECT_REDIRECT_URL` or a dedicated `/dashboard/connect/refresh` page) that checks authentication in the browser and re-initiates the onboarding POST request.
+
+**Where:** `services/payment-service/src/services/connect.service.ts:104-113`
+
+**Acceptance:**
+
+- [ ] `refresh_url` points to a valid frontend web URL (`CONNECT_REDIRECT_URL`), not a backend API POST route.
+- [ ] When a user's Stripe onboarding link expires, Stripe redirects to the frontend dashboard.
+- [ ] A unit test asserts `refresh_url` equals `CONNECT_REDIRECT_URL` (or frontend refresh path).
+
+#### B2-01 — Use cryptographically secure randomness for phone OTPs
+
+**Priority:** 🟠 High
+
+**What:** `phone.service.ts` generates 6-digit SMS verification one-time passwords using `Math.floor(100000 + Math.random() * 900000)`.
+
+**Why:** `Math.random()` uses a pseudo-random number generator (V8 Xoroshiro128+) that is not cryptographically secure. An attacker who observes several consecutive OTPs or seeds can predict subsequent OTP codes and bypass SMS phone verification.
+
+**How:** Replace `Math.random()` with `randomInt(100000, 1000000)` from `node:crypto`.
+
+**Where:** `services/user-service/src/services/phone.service.ts:20-22`
+
+**Acceptance:**
+
+- [ ] `generateCode` uses `randomInt` from `node:crypto`.
+- [ ] No `Math.random()` calls remain in `phone.service.ts`.
+- [ ] Generated codes are always 6 digits within the range `[100000, 999999]`.
+- [ ] A test asserts generated codes adhere to length and range requirements.
+
+#### B3-04 — Filter non-published campaigns on public getCampaign endpoint
+
+**Priority:** 🟠 High
+
+**What:** `getCampaign(id)` queries `prisma.campaign.findFirst({ where: { OR: [{ id }, { slug: id }] } })` with no status filter, and the route is public.
+
+**Why:** Anyone can view unpublished drafts, admin-paused campaigns, and cancelled campaigns simply by knowing or guessing their ID or slug, exposing confidential draft text, unannounced fundraising plans, and suspended content.
+
+**How:** Restrict unauthenticated public campaign lookups to `status: 'PUBLISHED'`. If the caller is authenticated and is the campaign organizer or an admin, allow viewing non-published statuses. Return 404 `NotFoundError` for non-published campaigns requested by the public.
+
+**Where:** `services/campaign-service/src/services/campaign.service.ts:163-216`
+
+**Acceptance:**
+
+- [ ] Public requests for a `DRAFT`, `PAUSED`, or `CANCELLED` campaign return 404.
+- [ ] Public requests for a `PUBLISHED` campaign succeed.
+- [ ] Campaign organizers and admins can still view their own non-published campaigns when authenticated.
+- [ ] Unit tests cover public vs organizer retrieval across all campaign statuses.
+
+#### B4-01 — Prevent donor email PII disclosure in campaign updates
+
+**Priority:** 🟠 High
+
+**What:** In `campaignUpdate.ts`, `processCampaignUpdate` sends campaign update emails to all campaign donors by passing `payload.donorEmails` directly to SES `SendEmailCommand` in `Destination.ToAddresses`.
+
+**Why:** SES places all addresses specified in `ToAddresses` into the visible email `To:` header. Every donor receives an email displaying up to 50 other donors' private email addresses, causing a severe privacy violation and PII leak.
+
+**How:** Send individual emails to each donor, or place donor email addresses in `BccAddresses` while setting `ToAddresses` to a generic address (e.g. `donors@penyzen.com` or `notifications@penyzen.com`).
+
+**Where:** `services/notification-service/src/processors/campaignUpdate.ts:16-22`
+
+**Acceptance:**
+
+- [ ] No email sent to multiple donors places multiple addresses in `ToAddresses`.
+- [ ] Donors receive updates with their address either in `BccAddresses` or via individualized sends.
+- [ ] A test asserts `sendEmail` is called with individual recipients or BCC, with zero donor PII leaked in visible headers.
+
+#### I1-09 — Retrieve GitHub access token from Secrets Manager, not CDK context
+
+**Priority:** 🟠 High
+
+**What:** `web-stack.ts` and `penyzen.ts` accept `github_token` as a CDK context argument (`-c github_token=ghp_xxx`) and assign it directly as a plaintext property on the Amplify App construct.
+
+**Why:** Passing sensitive tokens through CDK context bakes plaintext credentials into synthesized CloudFormation templates (`cdk.out`), template history in S3, and CloudFormation event logs, making the personal access token accessible to anyone with CloudFormation read access.
+
+**How:** Store the GitHub access token in AWS Secrets Manager and reference it using `SecretValue.secretsManager('penyzen/github-token')`, or migrate Amplify repository access to AWS CodeStar Connections.
+
+**Where:** `infra/bin/penyzen.ts:138`; `infra/lib/stacks/web-stack.ts:92`
+
+**Acceptance:**
+
+- [ ] `github_token` context argument is removed from deploy commands.
+- [ ] Amplify construct references the token via `SecretValue.secretsManager()`.
+- [ ] Synthesized CloudFormation template does not contain plaintext GitHub tokens.
+- [ ] CDK test asserts no token literals appear in synthesized templates.
+
+#### X1-10 — Add cdk synth to CI pull request workflow
+
+**Priority:** 🟠 High
+
+**What:** `.github/workflows/ci.yml` runs typechecks, linter, package builds, and unit tests, but never runs `cdk synth` for the `infra/` workspace.
+
+**Why:** CloudFormation synthesis errors, broken CDK construct imports, missing context parameters, and infrastructure type regressions are merged undetected into `dev` and `master`, failing only upon backend deployment in `deploy-backend.yml`.
+
+**How:** Add an infrastructure validation step to `.github/workflows/ci.yml` that builds `infra` and runs `npx cdk synth` with placeholder context values (`-c env=dev -c stripe_pk=pk_test_placeholder`).
+
+**Where:** `.github/workflows/ci.yml:50-64`
+
+**Acceptance:**
+
+- [ ] CI workflow includes a step running `npm run build` in `infra` and `npx cdk synth`.
+- [ ] PRs with invalid CDK props or synth errors fail CI before merging.
+- [ ] Placeholder context allows synthesis without requiring live AWS credentials.
