@@ -272,7 +272,7 @@ services/tests/
 
 Rules:
 
-- Use `.spec.ts` for unit/service tests and `.test.ts` for integration/controller tests.
+- Use `.spec.ts` or `.test.ts` for the test files.
 - Supertest drives the route/controller path without a running server.
 - The HTTP client in `integrations/common/http.ts` is the seam for mocking external calls.
 
